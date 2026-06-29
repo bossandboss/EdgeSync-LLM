@@ -1,0 +1,8 @@
+// go.sum is generated automatically by running:
+//   go mod tidy
+//
+// This file is intentionally left empty in the repository.
+// Run `go mod tidy` after cloning to populate it.
+//
+// Prerequisites:
+//   go get github.com/mattn/go-sqlite3@v1.14.22

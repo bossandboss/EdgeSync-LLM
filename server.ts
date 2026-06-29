@@ -23,12 +23,15 @@ app.use(express.json());
 const cacheManager = new CacheManager();
 
 // Global stats counters
-let totalQueries = 4; // Pre-seeded queries
+// DEMO_MODE: set DEMO_MODE=true to pre-seed metrics with realistic values for UI demo.
+// In production (DEMO_MODE=false or unset), all counters start at 0.
+const DEMO_MODE = process.env.DEMO_MODE === 'true';
+let totalQueries = DEMO_MODE ? 4 : 0;
 let hitCount = 0;
 let partialHitCount = 0;
-let missCount = 4;
+let missCount = DEMO_MODE ? 4 : 0;
 let batterySavingsMah = 0.0;
-let accumulatedLatencyMs = 4200.0; // Initial simulated legacy latency
+let accumulatedLatencyMs = DEMO_MODE ? 4200.0 : 0.0; // pre-seeded only in DEMO_MODE
 
 const recentQueries: QueryResult[] = [];
 

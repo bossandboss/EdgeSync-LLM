@@ -9,7 +9,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * EdgeSyncLLM — Android SDK for the EdgeCache KV fragment engine.
+ * EdgeSyncLLM — Android SDK for the EdgeSync-LLM KV fragment engine.
  *
  * This is a complete rewrite of the original SDK to expose the adapter/ package API:
  *   - KVFragment extraction and injection (replacing naive string cache)
@@ -22,7 +22,7 @@ import java.nio.ByteOrder
  * ─────────────
  *   Kotlin (coroutines, Android lifecycle) ──► JNI ──► Go (adapter/, cache/, embedding/)
  *
- * The Go layer is compiled as a shared library: libedgecache.so
+ * The Go layer is compiled as a shared library: libedgesync.so
  * via gomobile bind or a custom NDK toolchain (see sdk/android/BUILD.md).
  *
  * JNI FUNCTION NAMING
@@ -164,9 +164,9 @@ class EdgeSyncLLM private constructor(
     init {
         try {
             System.loadLibrary("edgecache")
-            Log.i(TAG, "libedgecache.so loaded")
+            Log.i(TAG, "libedgesync.so loaded")
         } catch (e: UnsatisfiedLinkError) {
-            Log.e(TAG, "Failed to load libedgecache.so: ${e.message}")
+            Log.e(TAG, "Failed to load libedgesync.so: ${e.message}")
             Log.w(TAG, "Running in stub mode — no real inference will occur")
         }
     }

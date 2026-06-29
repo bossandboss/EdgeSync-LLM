@@ -1,5 +1,5 @@
 // Package adapter defines the engine-agnostic interface that any local LLM
-// backend must implement to participate in the EdgeCache KV fragment system.
+// backend must implement to participate in the EdgeSync-LLM KV fragment system.
 //
 // CONTRACT
 // ────────
@@ -25,7 +25,7 @@ import (
 	"fmt"
 	"sync"
 
-	"react-example/cache"
+	"github.com/bossandboss/EdgeSync-LLM/cache"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

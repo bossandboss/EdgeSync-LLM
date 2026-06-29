@@ -33,7 +33,7 @@ import (
 	"fmt"
 	"math"
 
-	"react-example/cache"
+	"github.com/bossandboss/EdgeSync-LLM/cache"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

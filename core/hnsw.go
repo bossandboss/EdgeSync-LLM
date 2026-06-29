@@ -338,6 +338,60 @@ func (h *HNSW) Search(query []float32, k int) []SearchResult {
 	return finalResults
 }
 
+
+// Delete removes a node from the HNSW index and purges all references to it
+// from neighboring nodes. The entry node is updated if necessary.
+//
+// Time complexity: O(degree × M) — bounded by the max neighbor count.
+// Thread safety: caller must hold an exclusive lock if using concurrently.
+func (h *HNSW) Delete(id int) {
+	node, exists := h.Nodes[id]
+	if !exists {
+		return
+	}
+
+	// Remove all references to this node from its neighbors
+	for level, neighbors := range node.Neighbors {
+		for _, neighborID := range neighbors {
+			neighbor, ok := h.Nodes[neighborID]
+			if !ok {
+				continue
+			}
+			if level >= len(neighbor.Neighbors) {
+				continue
+			}
+			// Filter out the deleted node from this neighbor's list
+			filtered := neighbor.Neighbors[level][:0]
+			for _, nid := range neighbor.Neighbors[level] {
+				if nid != id {
+					filtered = append(filtered, nid)
+				}
+			}
+			neighbor.Neighbors[level] = filtered
+		}
+	}
+
+	// Remove the node itself
+	delete(h.Nodes, id)
+
+	// If the deleted node was the entry point, elect a new one
+	if h.EnterNode == id {
+		h.EnterNode = -1
+		h.MaxLevel = -1
+		for nid, n := range h.Nodes {
+			if h.MaxLevel == -1 || n.Level > h.MaxLevel {
+				h.MaxLevel = n.Level
+				h.EnterNode = nid
+			}
+		}
+	}
+}
+
+// Len returns the number of nodes currently in the index.
+func (h *HNSW) Len() int {
+	return len(h.Nodes)
+}
+
 // GobNode is a helper representation of a Node for encoding.
 type GobNode struct {
 	ID        int

@@ -1,4 +1,4 @@
-// Package main — EdgeCache KV fragment benchmark suite.
+// Package main — EdgeSync-LLM KV fragment benchmark suite.
 //
 // WHAT THIS BENCHMARK MEASURES
 // ──────────────────────────────
@@ -51,7 +51,7 @@
 //   go run ./benchmark/
 //
 // To run with verbose per-query output:
-//   EDGE_VERBOSE=1 go run ./benchmark/
+//   EDGESYNC_VERBOSE=1 go run ./benchmark/
 package main
 
 import (
@@ -62,8 +62,8 @@ import (
 	"sort"
 	"time"
 
-	"react-example/cache"
-	"react-example/core"
+	"github.com/bossandboss/EdgeSync-LLM/cache"
+	"github.com/bossandboss/EdgeSync-LLM/core"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -392,7 +392,7 @@ func (nc *NaiveCache) process(req SimRequest, rng *rand.Rand) QueryOutcome {
 	}
 }
 
-// FragmentCache simulates the EdgeCache KV fragment system.
+// FragmentCache simulates the EdgeSync-LLM KV fragment system.
 type FragmentCache struct {
 	hnsw       *core.HNSW
 	storedVecs map[int][]float32 // id → embedding (for similarity lookup)
@@ -429,7 +429,7 @@ func (fc *FragmentCache) process(req SimRequest, rng *rand.Rand) QueryOutcome {
 		}
 	}
 
-	verbose := os.Getenv("EDGE_VERBOSE") == "1"
+	verbose := os.Getenv("EDGESYNC_VERBOSE") == "1"
 
 	switch {
 	case bestSim >= cache.SimilarityExact:
@@ -580,7 +580,7 @@ func RunBenchmark() {
 	corpus := generateCorpus(N, rng)
 
 	fmt.Println("═══════════════════════════════════════════════════════════════════")
-	fmt.Println("  EDGECACHE KV FRAGMENT BENCHMARK — Qwen2.5-0.5B / Cortex-A55")
+	fmt.Println("  EDGESYNC-LLM KV FRAGMENT BENCHMARK — Qwen2.5-0.5B / Cortex-A55")
 	fmt.Printf("  %d requests × 3 modes — deterministic corpus, derived timing model\n", N)
 	fmt.Println("═══════════════════════════════════════════════════════════════════")
 	fmt.Printf("\nHardware constants (Cortex-A55 @1.8GHz, LPDDR4X, Q4_K_M):\n")

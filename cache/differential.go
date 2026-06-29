@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"react-example/core"
+	"github.com/bossandboss/EdgeSync-LLM/core"
 )
 
 // State representing the caching branch evaluated

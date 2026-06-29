@@ -7,14 +7,14 @@
 //   Option A — gomobile bind (recommended for most projects):
 //     go install golang.org/x/mobile/cmd/gomobile@latest
 //     gomobile init
-//     gomobile bind -target=android/arm64 -o edgecache.aar ./sdk/android/
+//     gomobile bind -target=android/arm64 -o edgesync-llm.aar ./sdk/android/
 //
 //   Option B — manual NDK cross-compilation (for full CGO control):
 //     export ANDROID_NDK_HOME=/path/to/ndk
 //     export CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
 //     CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
 //         go build -buildmode=c-shared \
-//         -o sdk/android/libs/arm64-v8a/libedgecache.so \
+//         -o sdk/android/libs/arm64-v8a/libedgesync.so \
 //         ./sdk/android/
 //
 // JNI NAMING CONVENTION
@@ -44,10 +44,10 @@ import (
 	"time"
 	"unsafe"
 
-	"react-example/adapter"
-	"react-example/cache"
-	"react-example/core"
-	"react-example/embedding"
+	"github.com/bossandboss/EdgeSync-LLM/adapter"
+	"github.com/bossandboss/EdgeSync-LLM/cache"
+	"github.com/bossandboss/EdgeSync-LLM/core"
+	"github.com/bossandboss/EdgeSync-LLM/embedding"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

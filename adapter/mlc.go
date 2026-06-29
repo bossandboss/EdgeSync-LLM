@@ -40,7 +40,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"react-example/cache"
+	"github.com/bossandboss/EdgeSync-LLM/cache"
 )
 
 const (

@@ -219,12 +219,20 @@ aarch64-linux-gnu-gcc -O3 -march=armv8.2-a+fp16 \
 
 ## License
 
-## ⚠️ Commercial & Licensing Notice
+This project is licensed under the **Business Source License 1.1 (BUSL-1.1)** — see the [LICENSE](LICENSE) file for details.
 
-**EdgeSync-LLM** is published under the **Business Source License 1.1 (BUSL-1.1)**.
-* **Non-Commercial & Evaluation:** 100% Free to use, modify, and test.
-* **Commercial Production Use:** Strictly prohibited for production deployment (mobile apps, SaaS, embedded hardware) without a commercial license.
+| Parameter | Value |
+|---|---|
+| Licensor | Wajdi Kechaou |
+| Licensed Work | EdgeSync-LLM |
+| Additional Use Grant | Free for non-production use (research, evaluation, personal projects) |
+| Change Date | 2028-01-01 |
+| Change License | Apache 2.0 |
 
-On **July 1, 2029**, this version of the software will automatically transition to the **AGPL-3.0** license.
+**What this means in practice:**
+- ✅ Free to use for research, evaluation, personal projects, and open-source development
+- ✅ Source code is readable and forkable
+- ❌ Production commercial use (SaaS, embedded product, hosted service) requires a paid license
+- 🔄 On 2028-01-01, the project automatically becomes Apache 2.0 (fully open-source)
 
-*To obtain a commercial production license, enterprise support, or custom hardware tuning (ARM NEON/NPU), contact:* **[kechaouwajdi@gmail.com]**
+**Commercial licensing:** for production integration without BUSL restrictions (SaaS, enterprise, OEM embedding), open an issue at [github.com/bossandboss/EdgeSync-LLM](https://github.com/bossandboss/EdgeSync-LLM/issues) with the label `commercial-license`.

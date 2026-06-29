@@ -13,8 +13,8 @@ import (
 	"fmt"
 	"log"
 
-	"react-example/adapter"
-	"react-example/cache"
+	"github.com/bossandboss/EdgeSync-LLM/adapter"
+	"github.com/bossandboss/EdgeSync-LLM/cache"
 )
 
 // ORTSession implements adapter.ONNXSession against onnxruntime_go.

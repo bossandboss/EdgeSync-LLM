@@ -1,4 +1,4 @@
-# EdgeCache — Integration Guide
+# EdgeSync-LLM — Integration Guide
 
 ## Table of Contents
 
@@ -407,7 +407,7 @@ expects given the model dimensions. This usually means `LayerStride` or
 **Fragment hit rate is unexpectedly low**
 
 The embedding model is not capturing semantic similarity correctly.
-Run `EDGE_VERBOSE=1 go run ./benchmark/` to see per-query similarity scores.
+Run `EDGESYNC_VERBOSE=1 go run ./benchmark/` to see per-query similarity scores.
 If most scores are below 0.60, your embedding model may not be well-suited
 to your prompt domain. Consider fine-tuning a MiniLM model on your data.
 
