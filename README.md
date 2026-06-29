@@ -223,16 +223,16 @@ This project is licensed under the **Business Source License 1.1 (BUSL-1.1)** �
 
 | Parameter | Value |
 |---|---|
-| Licensor | Wajdi Kechaou |
-| Licensed Work | EdgeSync-LLM |
-| Additional Use Grant | Free for non-production use (research, evaluation, personal projects) |
-| Change Date | 2028-01-01 |
-| Change License | Apache 2.0 |
+| Licensor | bossandboss (Wajdi Kechaou) |
+| Licensed Work | EdgeSync-LLM (source, submodules, adapters, tensor engines, documentation) |
+| Additional Use Grant | Non-commercial use, research, evaluation, development, internal testing |
+| Change Date | July 1, 2029 |
+| Change License | GNU Affero General Public License v3.0 (AGPL-3.0) |
 
 **What this means in practice:**
-- ✅ Free to use for research, evaluation, personal projects, and open-source development
+- ✅ Free for research, evaluation, development, and internal testing
 - ✅ Source code is readable and forkable
-- ❌ Production commercial use (SaaS, embedded product, hosted service) requires a paid license
-- 🔄 On 2028-01-01, the project automatically becomes Apache 2.0 (fully open-source)
+- ❌ Production use in commercial apps, SaaS platforms, or mobile apps deployed to end-users requires a commercial license
+- 🔄 On July 1, 2029, the project automatically becomes AGPL-3.0
 
-**Commercial licensing:** for production integration without BUSL restrictions (SaaS, enterprise, OEM embedding), open an issue at [github.com/bossandboss/EdgeSync-LLM](https://github.com/bossandboss/EdgeSync-LLM/issues) with the label `commercial-license`.
+**Commercial licensing:** open an issue at [github.com/bossandboss/EdgeSync-LLM](https://github.com/bossandboss/EdgeSync-LLM/issues) with the label `commercial-license`.
