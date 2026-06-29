@@ -170,10 +170,14 @@ func (s *FragmentStore) persist(f *KVFragment) error {
 	keysPath := filepath.Join(s.blobDir, f.ID+".keys.bin")
 	valsPath := filepath.Join(s.blobDir, f.ID+".vals.bin")
 
-	if err := os.WriteFile(keysPath, f.Keys, 0644); err != nil {
+	// Use atomic write (write-temp-rename) to prevent partial blobs on crash.
+	// See cache/atomic_write.go for full rationale.
+	if err := atomicWriteBlob(keysPath, f.Keys); err != nil {
 		return fmt.Errorf("persist: write keys blob: %w", err)
 	}
-	if err := os.WriteFile(valsPath, f.Values, 0644); err != nil {
+	if err := atomicWriteBlob(valsPath, f.Values); err != nil {
+		// Keys blob already written — clean it up before returning error
+		os.Remove(keysPath)
 		return fmt.Errorf("persist: write vals blob: %w", err)
 	}
 
@@ -317,6 +321,18 @@ func (s *FragmentStore) loadFromDB(id string) (*KVFragment, error) {
 	f.EmbeddingVector = bytesToFloat32SliceStore(embBlob)
 
 	// Load tensor blobs from disk (lazy: only Keys/Values, not hot-cached metadata)
+	// Validate blob sizes before reading — catch truncated files from crashes.
+	expectedBlobBytes := f.NumLayersCovered() * f.TokenSpan() * model.NumKVHeads * model.HeadDim * 4
+	if err := validateBlobSize(keysPath, expectedBlobBytes); err != nil {
+		// Corrupted blob — delete and treat as miss
+		go s.deleteFromDB(f.ID, keysPath, valsPath)
+		return nil, nil
+	}
+	if err := validateBlobSize(valsPath, expectedBlobBytes); err != nil {
+		go s.deleteFromDB(f.ID, keysPath, valsPath)
+		return nil, nil
+	}
+
 	f.Keys, err = os.ReadFile(keysPath)
 	if err != nil {
 		return nil, fmt.Errorf("loadFromDB: read keys blob %q: %w", keysPath, err)
@@ -399,6 +415,9 @@ func (s *FragmentStore) purgeExpired() error {
 }
 
 func (s *FragmentStore) deleteFromDB(id, keysPath, valsPath string) {
+	// Safe ordering: delete DB row FIRST, then files.
+	// If killed after DB delete but before file delete, orphanSweep() cleans up.
+	// Reverse ordering would leave DB rows pointing to missing files (hard error).
 	s.db.Exec(`DELETE FROM kv_fragments WHERE id = ?`, id)
 	os.Remove(keysPath)
 	os.Remove(valsPath)
