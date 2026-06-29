@@ -1,4 +1,4 @@
-# EdgeCache — KV Fragment Engine for Local LLMs
+# EdgeSync-LLM — KV Fragment Engine for Local LLMs
 
 A **engine-agnostic KV cache fragment system** for on-device LLM inference.
 Designed for ARM64 Android (Cortex-A55/A78), portable to any platform running
@@ -183,7 +183,7 @@ Run:
 go run ./benchmark/
 
 # Verbose per-query output:
-EDGE_VERBOSE=1 go run ./benchmark/
+EDGESYNC_VERBOSE=1 go run ./benchmark/
 ```
 
 ---
