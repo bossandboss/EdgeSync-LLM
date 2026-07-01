@@ -52,6 +52,13 @@ class EdgeSyncLLM private constructor(
         /** Path to all-MiniLM-L6-v2.ort (ONNX Runtime Mobile format). */
         val embeddingModelPath: String,
 
+        /**
+         * Path to the local GGUF model file (e.g. Qwen2.5-0.5B-Q4_K_M.gguf).
+         * Required when engine = "llamacpp" — nativeInitialize() will fail
+         * (return false) if this is empty for that engine.
+         */
+        val ggufModelPath: String = "",
+
         /** Which engine adapter to use: "llamacpp", "mlc", or "onnx". */
         val engine: String = "llamacpp",
 
@@ -191,6 +198,7 @@ class EdgeSyncLLM private constructor(
         val ok = nativeInitialize(
             engine = config.engine,
             modelIdJson = modelId,
+            ggufModelPath = config.ggufModelPath,
             embeddingModelPath = config.embeddingModelPath,
             dbPath = dbPath,
             blobDir = blobDir,
@@ -476,6 +484,7 @@ class EdgeSyncLLM private constructor(
     private external fun nativeInitialize(
         engine: String,
         modelIdJson: String,
+        ggufModelPath: String,
         embeddingModelPath: String,
         dbPath: String,
         blobDir: String,
@@ -591,6 +600,7 @@ class EdgeSyncLLM private constructor(
          *       config = EdgeSyncLLM.Config(
          *           storeDir = "${filesDir}/edgecache",
          *           embeddingModelPath = "${filesDir}/models/all-MiniLM-L6-v2.ort",
+         *           ggufModelPath = "${filesDir}/models/Qwen2.5-0.5B-Q4_K_M.gguf",
          *           engine = "llamacpp",
          *       )
          *   )

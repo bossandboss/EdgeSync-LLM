@@ -58,6 +58,19 @@ const (
 type ONNXAdapter struct {
 	session ONNXSession
 	modelID cache.ModelID
+
+	// pendingPastKeys/pendingPastVals hold the last injected KV state for use
+	// in the next Generate() call. Necessary because ONNX Runtime is
+	// stateless — past_key_values must be passed as explicit inputs on every
+	// call, unlike llama.cpp which keeps state inside its own context.
+	//
+	// Previously these three fields were missing entirely from this struct —
+	// InjectFragment() and Generate() both referenced them, so the package
+	// failed to compile as soon as anything else stopped masking the error
+	// (see the removed placeholder line further down this file).
+	pendingPastKeys [][]float32
+	pendingPastVals [][]float32
+	pendingTokenEnd int
 }
 
 // ONNXSession abstracts ONNX Runtime session calls.
@@ -229,11 +242,6 @@ func (a *ONNXAdapter) InjectFragment(ctx context.Context, fragment *cache.KVFrag
 
 	return nil
 }
-
-// pendingPastKeys/Vals hold the last injected KV state for use in Generate.
-// This is necessary because ONNX Runtime is stateless — past_key_values
-// must be passed as explicit inputs on every call.
-var _ = (*ONNXAdapter)(nil) // force field declaration via struct tag check
 
 func (a *ONNXAdapter) Generate(
 	ctx context.Context,

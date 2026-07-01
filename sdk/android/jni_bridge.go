@@ -86,6 +86,7 @@ func Java_com_edgecache_sdk_EdgeSyncLLM_nativeInitialize(
 	env *C.JNIEnv, obj C.jobject,
 	jEngine C.jstring,
 	jModelIdJson C.jstring,
+	jGgufModelPath C.jstring,
 	jEmbeddingModelPath C.jstring,
 	jDbPath C.jstring,
 	jBlobDir C.jstring,
@@ -94,6 +95,7 @@ func Java_com_edgecache_sdk_EdgeSyncLLM_nativeInitialize(
 ) C.jboolean {
 	engine := jstringToGo(env, jEngine)
 	modelIdJson := jstringToGo(env, jModelIdJson)
+	ggufModelPath := jstringToGo(env, jGgufModelPath)
 	embPath := jstringToGo(env, jEmbeddingModelPath)
 	dbPath := jstringToGo(env, jDbPath)
 	blobDir := jstringToGo(env, jBlobDir)
@@ -123,10 +125,49 @@ func Java_com_edgecache_sdk_EdgeSyncLLM_nativeInitialize(
 	// Initialize HNSW index
 	hnsw := core.NewHNSW(16, 50)
 
+	// Construct the actual inference adapter for the requested engine. This
+	// was previously missing entirely: the "engine" string was parsed and
+	// stored, but no adapter was ever built, so globalAdapter stayed nil
+	// forever and every inference call silently no-opped.
+	//
+	// ⚠ This wiring (and LoadLlamaCppModel in adapter/llamacpp.go) was written
+	// without access to a real llama.h / llama.cpp build to compile against —
+	// verify it builds and adjust nCtx/nThreads/nGpuLayers for your target
+	// device before shipping.
+	var kvAdapter adapter.KVAdapter
+	switch engine {
+	case "llamacpp":
+		if ggufModelPath == "" {
+			fmt.Printf("jni: engine=llamacpp requires a non-empty GGUF model path\n")
+			return C.jboolean(0)
+		}
+		nCtx := model.ContextLength
+		if nCtx <= 0 {
+			nCtx = 4096
+		}
+		llamaAdapter, err := initLlamaCppAdapter(ggufModelPath, model, nCtx, 4, 0)
+		if err != nil {
+			fmt.Printf("jni: LoadLlamaCppModel failed: %v\n", err)
+			return C.jboolean(0)
+		}
+		kvAdapter = llamaAdapter
+	case "mlc", "onnx":
+		// mlc.go / onnx.go define NewMLCAdapter / NewONNXAdapter but (unlike
+		// llamacpp) have no model-loading entry point wired up here yet either
+		// — they're pure-Go stubs as of this repo snapshot. Wire the real
+		// runtime/session construction here when those backends are ready.
+		fmt.Printf("jni: engine=%q has no model-loading path wired up yet — only \"llamacpp\" is implemented end-to-end\n", engine)
+		return C.jboolean(0)
+	default:
+		fmt.Printf("jni: unknown engine %q — expected \"llamacpp\", \"mlc\", or \"onnx\"\n", engine)
+		return C.jboolean(0)
+	}
+
 	globalMu.Lock()
 	globalEncoder = enc
 	globalStore = store
 	globalHNSW = hnsw
+	globalAdapter = kvAdapter
 	globalConfig = bridgeConfig{
 		engine:      engine,
 		layerStride: layerStride,

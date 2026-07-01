@@ -1,4 +1,13 @@
+//go:build !no_llamacpp
+
 // Package adapter — llama.cpp backend implementation of KVAdapter.
+//
+// BUILD TAG: this file requires llama.h/libllama at compile time (see the
+// #cgo directives below) and is included by default. If you only need the
+// MLC or ONNX backends and don't have llama.cpp available, exclude it with
+// `go build -tags no_llamacpp ./adapter/... ./sdk/android/...`
+// (sdk/android/engine_llamacpp.go / engine_llamacpp_stub.go mirror this same
+// tag so the JNI bridge compiles either way.)
 //
 // INTEGRATION NOTES FOR llama.cpp
 // ─────────────────────────────────
@@ -98,11 +107,6 @@ import (
 	"github.com/bossandboss/EdgeSync-LLM/cache"
 )
 
-const (
-	llamaCppEngineName    = "llamacpp"
-	llamaCppEngineVersion = "b3117"
-)
-
 // LlamaCppAdapter implements KVAdapter for the llama.cpp backend.
 // One instance per loaded model context — do not share across goroutines.
 type LlamaCppAdapter struct {
@@ -121,6 +125,59 @@ func NewLlamaCppAdapter(ctx unsafe.Pointer, modelID cache.ModelID) *LlamaCppAdap
 		ctx:     (*C.struct_llama_context)(ctx),
 		modelID: modelID,
 	}
+}
+
+// LoadLlamaCppModel loads a GGUF model from disk and returns a ready-to-use
+// LlamaCppAdapter. This is the piece that was previously missing end-to-end:
+// nativeInitialize() in sdk/android/jni_bridge.go accepted an "engine" string
+// but never actually called this — globalAdapter stayed nil forever, so every
+// inference-path JNI call silently no-opped via its "adapter not initialized"
+// branch, even after a "successful" nativeInitialize().
+//
+// ⚠ NOT COMPILED OR VERIFIED IN THE ENVIRONMENT THAT WROTE THIS. This sandbox
+// has no llama.h / no llama.cpp build available (see cache/differential.go
+// and friends, which WERE build+test verified — this file could not be).
+// Build this with the real headers (CGO_CFLAGS/CGO_LDFLAGS pointing at a
+// compiled llama.cpp checkout, matching the #cgo directives at the top of
+// this file) and fix any signature drift against your actual llama.cpp
+// version (the exact fields of llama_model_params / llama_context_params
+// change across llama.cpp releases — verify against the llama.h you're
+// linking against, not just this comment).
+//
+// nThreads: CPU threads for generation. nGpuLayers: 0 = CPU-only inference;
+// increase if a GPU/NPU backend is compiled into your libllama build.
+func LoadLlamaCppModel(ggufPath string, modelID cache.ModelID, nCtx, nThreads, nGpuLayers int) (*LlamaCppAdapter, error) {
+	cGgufPath := C.CString(ggufPath)
+	defer C.free(unsafe.Pointer(cGgufPath))
+
+	// llama_backend_init() is safe to call multiple times in recent llama.cpp
+	// versions, but if your version asserts on double-init, guard this with a
+	// sync.Once at package scope instead of calling it per-model-load.
+	C.llama_backend_init()
+
+	modelParams := C.llama_model_default_params()
+	modelParams.n_gpu_layers = C.int32_t(nGpuLayers)
+
+	model := C.llama_load_model_from_file(cGgufPath, modelParams)
+	if model == nil {
+		return nil, fmt.Errorf("LoadLlamaCppModel: llama_load_model_from_file failed for %q — check the path and that the file is a valid GGUF", ggufPath)
+	}
+
+	ctxParams := C.llama_context_default_params()
+	ctxParams.n_ctx = C.uint32_t(nCtx)
+	ctxParams.n_threads = C.int32_t(nThreads)
+	ctxParams.n_threads_batch = C.int32_t(nThreads)
+
+	ctx := C.llama_new_context_with_params(model, ctxParams)
+	if ctx == nil {
+		C.llama_free_model(model)
+		return nil, fmt.Errorf("LoadLlamaCppModel: llama_new_context_with_params failed for %q (n_ctx=%d, n_threads=%d)", ggufPath, nCtx, nThreads)
+	}
+
+	return &LlamaCppAdapter{
+		ctx:     ctx,
+		modelID: modelID,
+	}, nil
 }
 
 // ── KVAdapter identity ────────────────────────────────────────────────────────
@@ -293,26 +350,28 @@ func (a *LlamaCppAdapter) ClearKVCache(_ context.Context) error {
 	return nil
 }
 
-// Close releases the llama.cpp context.
+// Close releases the llama.cpp context and its underlying model.
+// NOTE: previously this only freed the context (llama_free), leaking the
+// model handle from llama_load_model_from_file(). Only call llama_get_model
+// + llama_free_model here if this adapter "owns" the model (i.e. it was
+// created via LoadLlamaCppModel, not via NewLlamaCppAdapter wrapping an
+// externally-managed context) — otherwise you'll double-free a model someone
+// else is still responsible for. Track ownership explicitly if you use both
+// construction paths in the same process.
 func (a *LlamaCppAdapter) Close() error {
-	if a.ctx != nil {
-		C.llama_free(a.ctx)
-		a.ctx = nil
+	if a.ctx == nil {
+		return nil
 	}
+	model := C.llama_get_model(a.ctx)
+	C.llama_free(a.ctx)
+	if model != nil {
+		C.llama_free_model(model)
+	}
+	a.ctx = nil
 	return nil
 }
 
 // ── Serialization helpers ─────────────────────────────────────────────────────
-
-// float32SliceTo4Bytes packs float32 values as little-endian IEEE 754 bytes.
-// This is the canonical "llamacpp" wire format for KV tensor blobs.
-func float32SliceTo4Bytes(src []float32) []byte {
-	out := make([]byte, len(src)*4)
-	for i, v := range src {
-		binary.LittleEndian.PutUint32(out[i*4:], math.Float32bits(v))
-	}
-	return out
-}
 
 // bytesToFloat32Slice deserializes the canonical llamacpp wire format.
 func bytesToFloat32Slice(src []byte) []float32 {
@@ -323,19 +382,4 @@ func bytesToFloat32Slice(src []byte) []float32 {
 		out[i] = math.Float32frombits(bits)
 	}
 	return out
-}
-
-// generateFragmentID produces a deterministic ID from the token IDs and model hash.
-// Using a hash rather than a random UUID means repeated extraction of the same prefix
-// produces the same ID, enabling deduplication at the storage layer.
-func generateFragmentID(tokenIDs []int32, model cache.ModelID) string {
-	h := fmt.Sprintf("%s:%d:%v", model.Hash(), time.Now().UnixNano(), tokenIDs[:min4(4, len(tokenIDs))])
-	return fmt.Sprintf("%x", []byte(h))[:16]
-}
-
-func min4(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -22,8 +22,11 @@ package adapter
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"sync"
+	"time"
 
 	"github.com/bossandboss/EdgeSync-LLM/cache"
 )
@@ -255,4 +258,46 @@ func CanInject(adapter KVAdapter, fragment *cache.KVFragment) error {
 	}
 
 	return nil
+}
+
+// generateFragmentID produces a deterministic ID from the token IDs and model hash.
+// Using a hash rather than a random UUID means repeated extraction of the same prefix
+// produces the same ID, enabling deduplication at the storage layer.
+//
+// Shared across all backends (llamacpp/mlc/onnx) — kept here, in the file
+// with no build tag, so it's available regardless of which engine tags are
+// active at build time (previously lived in llamacpp.go only, which broke
+// mlc.go/onnx.go whenever llamacpp.go was excluded).
+func generateFragmentID(tokenIDs []int32, model cache.ModelID) string {
+	h := fmt.Sprintf("%s:%d:%v", model.Hash(), time.Now().UnixNano(), tokenIDs[:minInt(4, len(tokenIDs))])
+	return fmt.Sprintf("%x", []byte(h))[:16]
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// llamaCppEngineName/llamaCppEngineVersion identify the llama.cpp backend.
+// Kept here (not in llamacpp.go) because reshape.go's cross-engine tensor
+// conversion needs llamaCppEngineName even when built with -tags no_llamacpp
+// (converting a fragment INTO llamacpp wire format doesn't require actually
+// linking llama.cpp — it's pure byte-layout logic).
+const (
+	llamaCppEngineName    = "llamacpp"
+	llamaCppEngineVersion = "b3117"
+)
+
+// float32SliceTo4Bytes packs float32 values as little-endian IEEE 754 bytes.
+// This is the canonical "llamacpp" wire format for KV tensor blobs. Kept
+// here rather than llamacpp.go for the same reason as above: reshape.go
+// needs it regardless of build tags.
+func float32SliceTo4Bytes(src []float32) []byte {
+	out := make([]byte, len(src)*4)
+	for i, v := range src {
+		binary.LittleEndian.PutUint32(out[i*4:], math.Float32bits(v))
+	}
+	return out
 }
