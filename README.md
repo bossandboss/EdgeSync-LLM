@@ -235,4 +235,4 @@ This project is licensed under the **Business Source License 1.1 (BUSL-1.1)** �
 - ❌ Production use in commercial apps, SaaS platforms, or mobile apps deployed to end-users requires a commercial license
 - 🔄 On July 1, 2029, the project automatically becomes AGPL-3.0
 
-**Commercial licensing:** open an issue at [github.com/tensor-master/EdgeSync-LLM](https://github.com/tensor-master/EdgeSync-LLM/issues) with the label `commercial-license`.
+**Commercial licensing:** open an issue at [github.com/bossandboss/EdgeSync-LLM](https://github.com/bossandboss/EdgeSync-LLM/issues) with the label `commercial-license`.
