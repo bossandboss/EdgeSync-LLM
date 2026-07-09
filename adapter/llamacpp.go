@@ -13,22 +13,22 @@
 // ─────────────────────────────────
 // llama.cpp exposes KV cache access via:
 //
-//   llama_kv_cache_view_init()  — get a view of the current KV cache
-//   llama_kv_cache_view_update() — refresh the view
-//   llama_kv_cache_seq_rm()     — remove a sequence from the cache
-//   llama_kv_cache_seq_cp()     — copy a sequence slot
-//   llama_kv_cache_seq_shift()  — shift token positions
+//	llama_kv_cache_view_init()  — get a view of the current KV cache
+//	llama_kv_cache_view_update() — refresh the view
+//	llama_kv_cache_seq_rm()     — remove a sequence from the cache
+//	llama_kv_cache_seq_cp()     — copy a sequence slot
+//	llama_kv_cache_seq_shift()  — shift token positions
 //
 // For direct tensor extraction (Keys/Values as raw floats), llama.cpp does NOT
 // expose a public API as of v0.0.3116. Two workarounds exist:
 //
-//   1. PATCH APPROACH: Add a thin C shim (extract_kv_slice.c) that reads
-//      `ctx->kv_self.k_l[layer]` and `ctx->kv_self.v_l[layer]` directly.
-//      Fragile but zero-overhead. Used in production for on-device Android builds.
+//  1. PATCH APPROACH: Add a thin C shim (extract_kv_slice.c) that reads
+//     `ctx->kv_self.k_l[layer]` and `ctx->kv_self.v_l[layer]` directly.
+//     Fragile but zero-overhead. Used in production for on-device Android builds.
 //
-//   2. GGML TENSOR APPROACH: After llama_decode(), iterate ggml_backend_tensor_get()
-//      on the named tensors "cache_k_l%d" and "cache_v_l%d". Cleaner API,
-//      available since llama.cpp b3117.
+//  2. GGML TENSOR APPROACH: After llama_decode(), iterate ggml_backend_tensor_get()
+//     on the named tensors "cache_k_l%d" and "cache_v_l%d". Cleaner API,
+//     available since llama.cpp b3117.
 //
 // This adapter uses approach 2 (the GGML tensor API) because it is stable and
 // works without patching the llama.cpp source tree.
@@ -43,7 +43,8 @@
 // calls in sdk/android/EdgeSyncLLM.kt.
 //
 // To build with CGO on the host for benchmarking:
-//   CGO_CFLAGS="-I/path/to/llama.cpp" CGO_LDFLAGS="-L/path/to/llama.cpp/build -lllama" go build
+//
+//	CGO_CFLAGS="-I/path/to/llama.cpp" CGO_LDFLAGS="-L/path/to/llama.cpp/build -lllama" go build
 package adapter
 
 // #cgo CFLAGS: -I../../llama.cpp/include -I../../llama.cpp/ggml/include
@@ -88,6 +89,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"strings"
 	"unsafe"
 
 	"github.com/bossandboss/EdgeSync-LLM/cache"
@@ -168,7 +170,7 @@ func LoadLlamaCppModel(ggufPath string, modelID cache.ModelID, nCtx, nThreads, n
 
 // ── KVAdapter identity ────────────────────────────────────────────────────────
 
-func (a *LlamaCppAdapter) EngineName() string    { return llamaCppEngineName }
+func (a *LlamaCppAdapter) EngineName() string     { return llamaCppEngineName }
 func (a *LlamaCppAdapter) EngineVersion() string  { return llamaCppEngineVersion }
 func (a *LlamaCppAdapter) ModelID() cache.ModelID { return a.modelID }
 
@@ -182,7 +184,8 @@ func (a *LlamaCppAdapter) CompatibleWith() []string { return []string{} }
 // KV tensors for layers [layerStart, layerEnd) with the given stride.
 //
 // The tensor data is serialized as flat IEEE 754 float32 in row-major order:
-//   layout: [layer_index][kv_head][token][head_dim]
+//
+//	layout: [layer_index][kv_head][token][head_dim]
 //
 // This format is the canonical "llamacpp" serialization read by InjectFragment
 // and by any adapter that declares "llamacpp" in CompatibleWith().
@@ -315,8 +318,32 @@ func (a *LlamaCppAdapter) InjectFragment(ctx context.Context, fragment *cache.KV
 	return nil
 }
 
+// vocab returns the model's vocabulary handle. Modern llama.cpp moved tokenizer
+// entry points off llama_model onto llama_vocab, reached via
+// llama_get_model(ctx) -> llama_model_get_vocab(model).
+func (a *LlamaCppAdapter) vocab() *C.struct_llama_vocab {
+	model := C.llama_get_model(a.ctx)
+	if model == nil {
+		return nil
+	}
+	return C.llama_model_get_vocab(model)
+}
+
 // Generate runs token generation from startTokenPos using the active KV cache.
 // If a fragment was injected before calling Generate, set startTokenPos = fragment.TokenEnd.
+//
+// SEMANTICS. startTokenPos is the number of prompt tokens whose KV state is
+// ALREADY present in the cache:
+//
+//	startTokenPos == 0            → cold path: prefill the entire prompt.
+//	startTokenPos == frag.TokenEnd → warm path: prefill only prompt[startTokenPos:],
+//	                                 the suffix the injected fragment doesn't cover.
+//
+// That skipped prefill is exactly the latency EdgeSync claims to remove, so this
+// function is what makes the TTFT benchmark meaningful.
+//
+// Positions are assigned absolutely (pos = startTokenPos + i) so the suffix lines
+// up with the injected fragment's KV cells rather than restarting at 0.
 func (a *LlamaCppAdapter) Generate(
 	ctx context.Context,
 	prompt string,
@@ -326,20 +353,216 @@ func (a *LlamaCppAdapter) Generate(
 	if a.ctx == nil {
 		return "", 0, fmt.Errorf("llamacpp: context is nil")
 	}
-	// Real implementation: call llama_decode() with a batch starting at startTokenPos,
-	// then sample tokens until EOS or maxTokens.
-	// This stub returns a placeholder to satisfy the interface.
-	return fmt.Sprintf("[llamacpp generation from pos %d, max %d tokens]", startTokenPos, maxTokens), 0, nil
+	if maxTokens <= 0 {
+		return "", 0, fmt.Errorf("llamacpp Generate: maxTokens must be > 0, got %d", maxTokens)
+	}
+
+	promptTokens, err := a.Tokenize(ctx, prompt)
+	if err != nil {
+		return "", 0, fmt.Errorf("llamacpp Generate: tokenize: %w", err)
+	}
+	if startTokenPos < 0 || startTokenPos > len(promptTokens) {
+		return "", 0, fmt.Errorf("llamacpp Generate: startTokenPos %d out of range [0,%d]",
+			startTokenPos, len(promptTokens))
+	}
+
+	suffix := promptTokens[startTokenPos:]
+	if len(suffix) == 0 {
+		// The fragment covers the whole prompt. We still need one token to
+		// produce logits, so re-decode the final prompt token at its own
+		// position. Guard against an empty prompt.
+		if len(promptTokens) == 0 {
+			return "", 0, fmt.Errorf("llamacpp Generate: empty prompt")
+		}
+		startTokenPos = len(promptTokens) - 1
+		suffix = promptTokens[startTokenPos:]
+	}
+
+	nCtx := int(C.llama_n_ctx(a.ctx))
+	if startTokenPos+len(suffix)+maxTokens > nCtx {
+		return "", 0, fmt.Errorf("llamacpp Generate: prompt(%d)+gen(%d) exceeds n_ctx(%d)",
+			startTokenPos+len(suffix), maxTokens, nCtx)
+	}
+
+	// ── Prefill: one batch holding the uncached suffix. ──
+	batch := C.llama_batch_init(C.int32_t(len(suffix)), 0, 1)
+	defer C.llama_batch_free(batch)
+
+	fillBatch := func(tokens []int32, basePos int) {
+		batch.n_tokens = C.int32_t(len(tokens))
+		for i, tok := range tokens {
+			setBatchToken(batch, i, tok, basePos+i, false)
+		}
+		// Only the last token needs logits — it's the one we sample from.
+		setBatchLogits(batch, len(tokens)-1, true)
+	}
+
+	fillBatch(suffix, startTokenPos)
+	if rc := C.llama_decode(a.ctx, batch); rc != 0 {
+		return "", 0, fmt.Errorf("llamacpp Generate: prefill llama_decode failed (code %d)", int(rc))
+	}
+
+	// ── Sampler: greedy (argmax). Deterministic on purpose. ──
+	// The benchmark compares the cold-path and warm-path first token to prove a
+	// KV fragment does not change the output. Any stochastic sampler would make
+	// that correctness check meaningless, so do NOT swap in top_k/top_p/dist here
+	// without also disabling the match assertion.
+	sparams := C.llama_sampler_chain_default_params()
+	smpl := C.llama_sampler_chain_init(sparams)
+	if smpl == nil {
+		return "", 0, fmt.Errorf("llamacpp Generate: llama_sampler_chain_init returned nil")
+	}
+	defer C.llama_sampler_free(smpl)
+	C.llama_sampler_chain_add(smpl, C.llama_sampler_init_greedy())
+
+	voc := a.vocab()
+	if voc == nil {
+		return "", 0, fmt.Errorf("llamacpp Generate: vocab is nil")
+	}
+
+	// ── Decode loop. ──
+	var sb strings.Builder
+	nGenerated := 0
+	curPos := startTokenPos + len(suffix)
+
+	for i := 0; i < maxTokens; i++ {
+		if err := ctx.Err(); err != nil {
+			return sb.String(), nGenerated, err
+		}
+
+		// Sample from the logits of the last decoded token (idx -1).
+		tok := C.llama_sampler_sample(smpl, a.ctx, C.int32_t(-1))
+
+		// A sampled end-of-generation token IS a produced token: the prefill ran
+		// and the model committed to an output. Time-to-first-token must count
+		// it, otherwise a prompt whose greedy continuation is EOG reports zero
+		// tokens and the caller times a decode that "did nothing" — which is how
+		// an impossibly fast TTFT gets recorded. Count first, then stop.
+		piece, err := a.tokenToPiece(voc, tok)
+		if err != nil {
+			return sb.String(), nGenerated, err
+		}
+		sb.WriteString(piece)
+		nGenerated++
+
+		if bool(C.llama_vocab_is_eog(voc, tok)) {
+			break
+		}
+		C.llama_sampler_accept(smpl, tok)
+
+		if nGenerated >= maxTokens {
+			break
+		}
+
+		// Feed the sampled token back in to advance the KV cache.
+		batch.n_tokens = 1
+		setBatchToken(batch, 0, int32(tok), curPos, true)
+		curPos++
+		if rc := C.llama_decode(a.ctx, batch); rc != 0 {
+			return sb.String(), nGenerated, fmt.Errorf("llamacpp Generate: decode failed at pos %d (code %d)", curPos-1, int(rc))
+		}
+	}
+
+	return sb.String(), nGenerated, nil
+}
+
+// tokenToPiece converts a single token to its text piece, growing the buffer if
+// llama_token_to_piece reports it was too small (it returns -needed in that case).
+// special=true so control/EOG tokens render as text ("<|im_end|>") instead of
+// an empty string. The benchmark compares the cold and warm first token; if EOG
+// rendered as "" the comparison would pass trivially and prove nothing.
+func (a *LlamaCppAdapter) tokenToPiece(voc *C.struct_llama_vocab, tok C.llama_token) (string, error) {
+	buf := make([]byte, 64)
+	n := C.llama_token_to_piece(voc, tok, (*C.char)(unsafe.Pointer(&buf[0])), C.int32_t(len(buf)), 0, C.bool(true))
+	if n < 0 {
+		buf = make([]byte, -int(n))
+		n = C.llama_token_to_piece(voc, tok, (*C.char)(unsafe.Pointer(&buf[0])), C.int32_t(len(buf)), 0, C.bool(true))
+		if n < 0 {
+			return "", fmt.Errorf("llamacpp: llama_token_to_piece failed for token %d (code %d)", int(tok), int(n))
+		}
+	}
+	return string(buf[:int(n)]), nil
 }
 
 // Tokenize converts text to llama.cpp token IDs via llama_tokenize().
+//
+// Two-pass: llama_tokenize returns -needed when the output buffer is too small.
+// add_special=true prepends BOS per the model's convention (matching how the
+// prompt would be tokenized at inference time); parse_special=true so chat
+// template control tokens are recognised rather than emitted as literal text.
 func (a *LlamaCppAdapter) Tokenize(_ context.Context, text string) ([]int32, error) {
 	if a.ctx == nil {
 		return nil, fmt.Errorf("llamacpp: context is nil")
 	}
-	// Real: call C.llama_tokenize() and return the token array.
-	// Stub returns placeholder.
-	return []int32{1, 2, 3}, nil
+	voc := a.vocab()
+	if voc == nil {
+		return nil, fmt.Errorf("llamacpp Tokenize: vocab is nil")
+	}
+	if text == "" {
+		return []int32{}, nil
+	}
+
+	cText := C.CString(text)
+	defer C.free(unsafe.Pointer(cText))
+	textLen := C.int32_t(len(text))
+
+	// Upper bound: one token per byte, plus room for BOS/EOS.
+	capacity := len(text) + 8
+	toks := make([]C.llama_token, capacity)
+
+	n := C.llama_tokenize(voc, cText, textLen,
+		(*C.llama_token)(unsafe.Pointer(&toks[0])), C.int32_t(capacity),
+		C.bool(true), C.bool(true))
+
+	if n < 0 {
+		// Buffer too small: llama_tokenize returned -(required length).
+		capacity = -int(n)
+		toks = make([]C.llama_token, capacity)
+		n = C.llama_tokenize(voc, cText, textLen,
+			(*C.llama_token)(unsafe.Pointer(&toks[0])), C.int32_t(capacity),
+			C.bool(true), C.bool(true))
+		if n < 0 {
+			return nil, fmt.Errorf("llamacpp Tokenize: llama_tokenize failed (code %d)", int(n))
+		}
+	}
+
+	out := make([]int32, int(n))
+	for i := 0; i < int(n); i++ {
+		out[i] = int32(toks[i])
+	}
+	return out, nil
+}
+
+// setBatchToken writes slot i of a llama_batch. The C arrays are raw pointers,
+// so index them through unsafe.Slice rather than Go slice syntax.
+// Each token is assigned to sequence 0.
+func setBatchToken(batch C.struct_llama_batch, i int, tok int32, pos int, wantLogits bool) {
+	tokens := unsafe.Slice((*C.llama_token)(unsafe.Pointer(batch.token)), i+1)
+	tokens[i] = C.llama_token(tok)
+
+	positions := unsafe.Slice((*C.llama_pos)(unsafe.Pointer(batch.pos)), i+1)
+	positions[i] = C.llama_pos(pos)
+
+	nSeqIDs := unsafe.Slice((*C.int32_t)(unsafe.Pointer(batch.n_seq_id)), i+1)
+	nSeqIDs[i] = 1
+
+	seqIDPtrs := unsafe.Slice((**C.llama_seq_id)(unsafe.Pointer(batch.seq_id)), i+1)
+	seqIDs := unsafe.Slice((*C.llama_seq_id)(unsafe.Pointer(seqIDPtrs[i])), 1)
+	seqIDs[0] = 0
+
+	setBatchLogits(batch, i, wantLogits)
+}
+
+func setBatchLogits(batch C.struct_llama_batch, i int, want bool) {
+	if i < 0 {
+		return
+	}
+	logits := unsafe.Slice((*C.int8_t)(unsafe.Pointer(batch.logits)), i+1)
+	var v C.int8_t
+	if want {
+		v = 1
+	}
+	logits[i] = v
 }
 
 // ClearKVCache removes all sequences from the llama.cpp KV cache.

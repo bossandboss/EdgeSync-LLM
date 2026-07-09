@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -58,6 +59,7 @@ func main() {
 	flag.IntVar(&cfg.Adapter.NumKVHeads, "kv-heads", 8, "num KV heads")
 	flag.IntVar(&cfg.Adapter.NumLayers, "layers", 24, "num transformer layers")
 
+	flag.BoolVar(&cfg.Strict, "strict", true, "abort on the first engine error instead of timing the failure path")
 	outDir := flag.String("out", "./results", "output directory")
 	flag.Parse()
 
@@ -71,9 +73,30 @@ func main() {
 
 	printBanner()
 
+	// PREFLIGHT: prove the engine really decodes before collecting any numbers.
+	ptoks, tokps, perr := h.Preflight(context.Background(), reqs[0])
+	if perr != nil {
+		fmt.Fprintln(os.Stderr, "PREFLIGHT FAILED:", perr)
+		fmt.Fprintln(os.Stderr, "No numbers are reported. Fix the engine, then re-run.")
+		os.Exit(1)
+	}
+	fmt.Printf("preflight: prompt=%d tokens, prefill=%.0f tok/s (%.1f ms)\n\n",
+		ptoks, tokps, float64(ptoks)/tokps*1000)
+	if tokps > 8000 {
+		fmt.Fprintln(os.Stderr, "WARNING: implausibly high prefill throughput. The engine may not be")
+		fmt.Fprintln(os.Stderr, "decoding. Treat every latency below as suspect until explained.")
+	}
+
 	start := time.Now()
-	rep := h.Run(reqs)
+	rep, runErr := h.Run(reqs)
 	dur := time.Since(start).Seconds()
+	if runErr != nil {
+		fmt.Fprintln(os.Stderr, "RUN ABORTED:", runErr)
+		fmt.Fprintln(os.Stderr, "No numbers are reported (use -strict=false to continue past errors).")
+		os.Exit(1)
+	}
+	rep.PromptTokens = ptoks
+	rep.PrefillTokPS = tokps
 
 	man := &Manifest{
 		Schema:      "edgesync.bench/v1",
@@ -153,6 +176,11 @@ func printTable(m *Manifest) {
 	fmt.Printf("  fragments stored   %d   total=%.2f MB   avg=%.2f MB\n",
 		r.FragmentCount, r.FragTotalMB, r.FragAvgMB)
 	fmt.Printf("  process RSS delta  %.1f MB\n", r.RSSDeltaMB)
+	fmt.Printf("  engine errors      generate=%d extract=%d inject=%d\n",
+		r.GenErrors, r.ExtractErrors, r.InjectErrors)
+	if r.GenErrors+r.ExtractErrors+r.InjectErrors > 0 {
+		fmt.Println("\n  ⚠ ENGINE ERRORS OCCURRED. Latencies above may include failure paths.")
+	}
 
 	if r.TotalHits > 0 && r.MatchRatePct < 99.0 {
 		fmt.Println("\n  ⚠ CORRECTNESS WARNING: injected-fragment output diverges from cold")

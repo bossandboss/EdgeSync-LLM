@@ -14,6 +14,9 @@ type Request struct {
 	ClusterID int
 }
 
+// uniqueTag makes non-reuse preambles distinct from one another.
+const uniqueTag = "ctx"
+
 // buildCorpus generates a realistic on-device workload.
 //
 // WHY THIS SHAPE. KV-fragment reuse only pays off when requests SHARE a long
@@ -93,12 +96,18 @@ func buildCorpus(n int, prefixShare float64, seed int64) []Request {
 
 		var full string
 		if reuse {
-			// Same preamble (cacheable prefix) + a different short user turn.
+			// Same preamble byte-for-byte (the cacheable prefix) + a different
+			// short user turn. This is the request a KV fragment can serve.
 			full = ctx.preamble + "\n\nUser: " + turn + "\nAssistant:"
 		} else {
-			// First encounter of this context, or a forced-new request. Mark seen.
+			// A genuinely NEW context: the preamble must differ, otherwise this
+			// request shares a prefix with earlier ones and prefixShare has no
+			// effect. A unique nonce inside the preamble guarantees a distinct
+			// prefix, so -prefix-share 0 really does mean "no reuse possible"
+			// (all misses, cold path only).
 			seen[cid] = true
-			full = ctx.preamble + "\n\nUser: " + turn + "\nAssistant:"
+			full = ctx.preamble + fmt.Sprintf("\nSession: %s-%06d\n", uniqueTag, i) +
+				"\n\nUser: " + turn + "\nAssistant:"
 		}
 		reqs[i] = Request{Full: full, ClusterID: cid}
 	}

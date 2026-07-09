@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"sort"
 	"strconv"
@@ -15,8 +16,7 @@ import (
 	"github.com/bossandboss/EdgeSync-LLM/embedding"
 )
 
-// AdapterConfig is consumed by the build-tagged newAdapter() in either
-// adapter_mock.go (host) or adapter_device.go (-tags realdevice).
+// AdapterConfig is consumed by the build-tagged newAdapter().
 type AdapterConfig struct {
 	ModelPath  string
 	Arch       string
@@ -30,8 +30,6 @@ type AdapterConfig struct {
 	NumLayers  int
 }
 
-// Config holds all run parameters. Everything here is written into the JSON
-// manifest so a run is fully reproducible.
 type Config struct {
 	N           int
 	MaxGen      int
@@ -40,6 +38,7 @@ type Config struct {
 	Seed        int64
 	PrefixShare float64
 	EmbedDir    string
+	Strict      bool
 	Adapter     AdapterConfig
 }
 
@@ -47,31 +46,41 @@ type harness struct {
 	ad  Engine
 	enc embedding.Encoder
 	cfg Config
+	rng *rand.Rand
+
+	// Error accounting. A benchmark that silently swallows engine errors will
+	// report the latency of the FAILURE PATH as if it were a result. That is
+	// how a 9 ms "TTFT" appears for a prefill that cannot cost less than a few
+	// hundred ms. Every error is counted and surfaced.
+	genErrs     int
+	extractErrs int
+	injectErrs  int
+	firstErr    error
 }
 
-// Sample is one recorded fragment-path request outcome.
 type Sample struct {
 	Index      int     `json:"i"`
 	ClusterID  int     `json:"cluster"`
-	Status     string  `json:"status"` // EXACT | PARTIAL | MISS
+	Status     string  `json:"status"`
 	TTFTms     float64 `json:"ttft_ms"`
+	ColdMs     float64 `json:"cold_ms"`
 	InjectMs   float64 `json:"inject_ms"`
 	FragBytes  int     `json:"frag_bytes"`
 	FirstToken string  `json:"-"`
+	ColdToken  string  `json:"-"`
 }
 
-// Report is the full result payload (also serialised to JSON).
 type Report struct {
 	ColdTTFT      Dist     `json:"cold_ttft"`
-	FragTTFTAll   Dist     `json:"frag_ttft_all"`  // includes misses (end-to-end)
-	FragTTFTHits  Dist     `json:"frag_ttft_hits"` // hits only
+	FragTTFTAll   Dist     `json:"frag_ttft_all"`
+	FragTTFTHits  Dist     `json:"frag_ttft_hits"`
 	HitRatePct    float64  `json:"hit_rate_pct"`
 	ExactHits     int      `json:"exact_hits"`
 	PartialHits   int      `json:"partial_hits"`
 	Misses        int      `json:"misses"`
 	SpeedupAll    float64  `json:"speedup_all"`
 	SpeedupHits   float64  `json:"speedup_hits"`
-	SigDisjoint   bool     `json:"speedup_significant"` // CIs non-overlapping
+	SigDisjoint   bool     `json:"speedup_significant"`
 	CorrectHits   int      `json:"correct_hits"`
 	TotalHits     int      `json:"total_hits"`
 	MatchRatePct  float64  `json:"match_rate_pct"`
@@ -79,7 +88,12 @@ type Report struct {
 	FragTotalMB   float64  `json:"fragment_total_mb"`
 	FragAvgMB     float64  `json:"fragment_avg_mb"`
 	RSSDeltaMB    float64  `json:"rss_delta_mb"`
-	Samples       []Sample `json:"-"` // written to CSV, not JSON manifest
+	GenErrors     int      `json:"generate_errors"`
+	ExtractErrors int      `json:"extract_errors"`
+	InjectErrors  int      `json:"inject_errors"`
+	PromptTokens  int      `json:"preflight_prompt_tokens"`
+	PrefillTokPS  float64  `json:"preflight_prefill_tok_per_s"`
+	Samples       []Sample `json:"-"`
 }
 
 func newHarness(cfg Config) (*harness, error) {
@@ -91,16 +105,48 @@ func newHarness(cfg Config) (*harness, error) {
 	if err != nil {
 		return nil, fmt.Errorf("embedding: %w", err)
 	}
-	return &harness{ad: ad, enc: enc, cfg: cfg}, nil
+	return &harness{ad: ad, enc: enc, cfg: cfg, rng: rand.New(rand.NewSource(cfg.Seed ^ 0x5eed))}, nil
 }
 
-// timeMs runs fn Warmup times (discarded) then Repeats times (recorded) and
-// returns the MEDIAN observed wall-clock in ms plus the last return value.
-// Median is used per call-site to suppress scheduler jitter before the samples
-// enter the aggregate distribution.
-func (h *harness) timeMs(fn func() string) (float64, string) {
+// Preflight runs ONE request end to end with every error checked, and reports
+// the prompt token count plus the implied prefill throughput. This is the
+// sanity gate: if the engine is not really decoding, it surfaces here as an
+// error or as an absurd tok/s, BEFORE any distribution is collected.
+func (h *harness) Preflight(ctx context.Context, r Request) (int, float64, error) {
+	toks, err := h.ad.Tokenize(ctx, r.Full)
+	if err != nil {
+		return 0, 0, fmt.Errorf("preflight Tokenize: %w", err)
+	}
+	if len(toks) == 0 {
+		return 0, 0, fmt.Errorf("preflight: Tokenize returned 0 tokens - tokenizer not wired")
+	}
+	if err := h.ad.ClearKVCache(ctx); err != nil {
+		return len(toks), 0, fmt.Errorf("preflight ClearKVCache: %w", err)
+	}
+	t0 := time.Now()
+	out, n, err := h.ad.Generate(ctx, r.Full, 0, 1)
+	el := time.Since(t0).Seconds()
+	if err != nil {
+		return len(toks), 0, fmt.Errorf("preflight Generate: %w", err)
+	}
+	if n < 1 {
+		return len(toks), 0, fmt.Errorf("preflight: Generate produced %d tokens (expected >=1) - decode loop not running", n)
+	}
+	if strings.HasPrefix(out, "[llamacpp generation") {
+		return len(toks), 0, fmt.Errorf("preflight: Generate returned the STUB placeholder - adapter not rebuilt")
+	}
+	tokPS := 0.0
+	if el > 0 {
+		tokPS = float64(len(toks)) / el
+	}
+	return len(toks), tokPS, nil
+}
+
+func (h *harness) timeMs(fn func() (string, error), kind string) (float64, string, error) {
 	for i := 0; i < h.cfg.Warmup; i++ {
-		fn()
+		if _, err := fn(); err != nil {
+			return 0, "", fmt.Errorf("%s (warmup): %w", kind, err)
+		}
 	}
 	reps := h.cfg.Repeats
 	if reps < 1 {
@@ -110,58 +156,78 @@ func (h *harness) timeMs(fn func() string) (float64, string) {
 	var last string
 	for i := 0; i < reps; i++ {
 		t0 := time.Now()
-		last = fn()
+		s, err := fn()
 		obs[i] = float64(time.Since(t0).Microseconds()) / 1000.0
+		if err != nil {
+			return 0, "", fmt.Errorf("%s: %w", kind, err)
+		}
+		last = s
 	}
 	sort.Float64s(obs)
-	return obs[len(obs)/2], last
+	return obs[len(obs)/2], last, nil
 }
 
-// Run executes the two passes and assembles the report.
-func (h *harness) Run(reqs []Request) *Report {
+func (h *harness) noteErr(err error, which *int) {
+	*which++
+	if h.firstErr == nil {
+		h.firstErr = err
+	}
+}
+
+func (h *harness) measureCold(ctx context.Context, r Request) (float64, string, error) {
+	return h.timeMs(func() (string, error) {
+		if err := h.ad.ClearKVCache(ctx); err != nil {
+			return "", err
+		}
+		txt, _, err := h.ad.Generate(ctx, r.Full, 0, 1)
+		return txt, err
+	}, "cold Generate")
+}
+
+func (h *harness) measureWarm(ctx context.Context, r Request, frag *cache.KVFragment) (float64, float64, string, error) {
+	inj, _, err := h.timeMs(func() (string, error) {
+		if e := h.ad.ClearKVCache(ctx); e != nil {
+			return "", e
+		}
+		return "", h.ad.InjectFragment(ctx, frag)
+	}, "InjectFragment")
+	if err != nil {
+		return 0, 0, "", err
+	}
+	gen, first, err := h.timeMs(func() (string, error) {
+		txt, _, e := h.ad.Generate(ctx, r.Full, frag.TokenEnd, 1)
+		return txt, e
+	}, "warm Generate")
+	if err != nil {
+		return 0, 0, "", err
+	}
+	return inj + gen, inj, first, nil
+}
+
+// Run measures cold and warm for EACH request back to back, in randomised
+// order, rather than one full cold pass followed by one full fragment pass.
+// Sequential passes let slow drift (page cache warming, CPU frequency,
+// thermals) masquerade as a speedup: a cold-then-warm layout reports a
+// "significant" gain even when both paths execute identical code. Pairing and
+// shuffling removes that confound.
+func (h *harness) Run(reqs []Request) (*Report, error) {
 	ctx := context.Background()
 	rep := &Report{}
 	rssStart := readRSSMB()
 
-	// ── Pass 1: COLD (no cache). Full prefill + 1 token = time-to-first-token. ──
-	coldTTFT := make([]float64, len(reqs))
-	coldFirst := make([]string, len(reqs))
-	for i, r := range reqs {
-		ms, first := h.timeMs(func() string {
-			_ = h.ad.ClearKVCache(ctx)
-			txt, _, _ := h.ad.Generate(ctx, r.Full, 0, 1)
-			return txt
-		})
-		coldTTFT[i] = ms
-		coldFirst[i] = first
-	}
-
-	// ── Pass 2: FRAGMENT (HNSW KV reuse). ──
 	hnsw := core.NewHNSW(16, 50)
 	storedVecs := map[int][]float32{}
 	fragStore := map[int]*cache.KVFragment{}
 	nextID := 1
 
-	var fragAll, fragHits []float64
+	var coldAll, fragAll, fragHits []float64
 	var totalFragBytes int
 
 	for i, r := range reqs {
-		emb, err := h.enc.Encode(r.Full)
-		if err != nil {
-			// Embedding failure ⇒ treat as forced miss (cold), no store.
-			ms, _ := h.timeMs(func() string {
-				_ = h.ad.ClearKVCache(ctx)
-				txt, _, _ := h.ad.Generate(ctx, r.Full, 0, 1)
-				return txt
-			})
-			fragAll = append(fragAll, ms)
-			rep.Misses++
-			rep.Samples = append(rep.Samples, Sample{Index: i, ClusterID: r.ClusterID, Status: "MISS", TTFTms: ms})
-			continue
-		}
+		emb, encErr := h.enc.Encode(r.Full)
 
 		bestSim, bestID := float32(-1), -1
-		if len(storedVecs) > 0 {
+		if encErr == nil && len(storedVecs) > 0 {
 			for _, nb := range hnsw.Search(emb, 1) {
 				if v, ok := storedVecs[nb.ID]; ok {
 					if s := cosine(emb, v); s > bestSim {
@@ -171,65 +237,113 @@ func (h *harness) Run(reqs []Request) *Report {
 			}
 		}
 
-		switch {
-		case bestID >= 0 && bestSim >= cache.SimilarityExact:
-			s := h.hitSample(ctx, i, r, fragStore[bestID], "EXACT", coldFirst[i])
-			fragAll = append(fragAll, s.TTFTms)
-			fragHits = append(fragHits, s.TTFTms)
-			rep.ExactHits++
-			rep.Samples = append(rep.Samples, s)
+		status := "MISS"
+		if bestID >= 0 && bestSim >= cache.SimilarityExact {
+			status = "EXACT"
+		} else if bestID >= 0 && bestSim >= cache.SimilarityPartial {
+			status = "PARTIAL"
+		}
 
-		case bestID >= 0 && bestSim >= cache.SimilarityPartial:
-			s := h.hitSample(ctx, i, r, fragStore[bestID], "PARTIAL", coldFirst[i])
-			fragAll = append(fragAll, s.TTFTms)
-			fragHits = append(fragHits, s.TTFTms)
-			rep.PartialHits++
-			rep.Samples = append(rep.Samples, s)
-
-		default: // MISS: cold gen, then extract + store for future reuse.
-			ms, _ := h.timeMs(func() string {
-				_ = h.ad.ClearKVCache(ctx)
-				txt, _, _ := h.ad.Generate(ctx, r.Full, 0, 1)
-				return txt
-			})
-			fragAll = append(fragAll, ms)
+		if status == "MISS" {
+			coldMs, coldTok, err := h.measureCold(ctx, r)
+			if err != nil {
+				h.noteErr(err, &h.genErrs)
+				if h.cfg.Strict {
+					return nil, fmt.Errorf("request %d: %w", i, err)
+				}
+				continue
+			}
+			coldAll = append(coldAll, coldMs)
+			fragAll = append(fragAll, coldMs)
 			rep.Misses++
-			s := Sample{Index: i, ClusterID: r.ClusterID, Status: "MISS", TTFTms: ms}
+			s := Sample{Index: i, ClusterID: r.ClusterID, Status: "MISS", TTFTms: coldMs, ColdMs: coldMs, ColdToken: coldTok}
 
-			if toks, err := h.ad.Tokenize(ctx, r.Full); err == nil && len(toks) >= cache.FragmentGranularityTokens {
-				frag, err := h.ad.ExtractFragment(ctx, toks, 0, h.ad.ModelID().NumLayers, cache.FragmentLayerStride, emb)
-				if err == nil && frag != nil {
-					hnsw.Insert(nextID, emb)
-					storedVecs[nextID] = emb
-					fragStore[nextID] = frag
-					nextID++
-					totalFragBytes += frag.SizeBytes()
-					s.FragBytes = frag.SizeBytes()
+			if encErr == nil {
+				toks, err := h.ad.Tokenize(ctx, r.Full)
+				if err != nil {
+					h.noteErr(err, &h.extractErrs)
+					if h.cfg.Strict {
+						return nil, fmt.Errorf("request %d: Tokenize: %w", i, err)
+					}
+				} else if len(toks) >= cache.FragmentGranularityTokens {
+					frag, err := h.ad.ExtractFragment(ctx, toks, 0, h.ad.ModelID().NumLayers, cache.FragmentLayerStride, emb)
+					if err != nil || frag == nil {
+						if err == nil {
+							err = fmt.Errorf("ExtractFragment returned nil fragment")
+						}
+						h.noteErr(err, &h.extractErrs)
+						if h.cfg.Strict {
+							return nil, fmt.Errorf("request %d: %w", i, err)
+						}
+					} else {
+						hnsw.Insert(nextID, emb)
+						storedVecs[nextID] = emb
+						fragStore[nextID] = frag
+						nextID++
+						totalFragBytes += frag.SizeBytes()
+						s.FragBytes = frag.SizeBytes()
+					}
 				}
 			}
 			rep.Samples = append(rep.Samples, s)
+			continue
 		}
+
+		frag := fragStore[bestID]
+		var coldMs, warmMs, injMs float64
+		var coldTok, warmTok string
+		var err error
+
+		if h.rng.Intn(2) == 0 {
+			coldMs, coldTok, err = h.measureCold(ctx, r)
+			if err == nil {
+				warmMs, injMs, warmTok, err = h.measureWarm(ctx, r, frag)
+			}
+		} else {
+			warmMs, injMs, warmTok, err = h.measureWarm(ctx, r, frag)
+			if err == nil {
+				coldMs, coldTok, err = h.measureCold(ctx, r)
+			}
+		}
+		if err != nil {
+			h.noteErr(err, &h.injectErrs)
+			if h.cfg.Strict {
+				return nil, fmt.Errorf("request %d: %w", i, err)
+			}
+			continue
+		}
+
+		coldAll = append(coldAll, coldMs)
+		fragAll = append(fragAll, warmMs)
+		fragHits = append(fragHits, warmMs)
+		if status == "EXACT" {
+			rep.ExactHits++
+		} else {
+			rep.PartialHits++
+		}
+		rep.Samples = append(rep.Samples, Sample{
+			Index: i, ClusterID: r.ClusterID, Status: status,
+			TTFTms: warmMs, ColdMs: coldMs, InjectMs: injMs,
+			FragBytes: frag.SizeBytes(), FirstToken: warmTok, ColdToken: coldTok,
+		})
 	}
 
-	// ── Aggregate ──
-	rep.ColdTTFT = summarise(coldTTFT)
+	rep.ColdTTFT = summarise(coldAll)
 	rep.FragTTFTAll = summarise(fragAll)
 	rep.FragTTFTHits = summarise(fragHits)
 
-	n := len(reqs)
 	hits := rep.ExactHits + rep.PartialHits
-	if n > 0 {
+	if n := len(reqs); n > 0 {
 		rep.HitRatePct = float64(hits) / float64(n) * 100
 	}
 	rep.SpeedupAll = speedup(rep.ColdTTFT, rep.FragTTFTAll)
 	rep.SpeedupHits = speedup(rep.ColdTTFT, rep.FragTTFTHits)
 	rep.SigDisjoint = ciDisjoint(rep.ColdTTFT, rep.FragTTFTAll)
 
-	// Correctness: for hit requests, does the warm first token match the cold one?
 	for _, s := range rep.Samples {
 		if s.Status == "EXACT" || s.Status == "PARTIAL" {
 			rep.TotalHits++
-			if s.FirstToken == coldFirst[s.Index] {
+			if s.FirstToken == s.ColdToken {
 				rep.CorrectHits++
 			}
 		}
@@ -244,33 +358,12 @@ func (h *harness) Run(reqs []Request) *Report {
 		rep.FragAvgMB = rep.FragTotalMB / float64(rep.FragmentCount)
 	}
 	rep.RSSDeltaMB = readRSSMB() - rssStart
-	return rep
+	rep.GenErrors = h.genErrs
+	rep.ExtractErrors = h.extractErrs
+	rep.InjectErrors = h.injectErrs
+	return rep, nil
 }
 
-// hitSample measures inject + first-token generation for a cache hit.
-func (h *harness) hitSample(ctx context.Context, i int, r Request, frag *cache.KVFragment, status, coldFirst string) Sample {
-	var injMs float64
-	injMs, _ = h.timeMs(func() string {
-		_ = h.ad.ClearKVCache(ctx)
-		_ = h.ad.InjectFragment(ctx, frag)
-		return ""
-	})
-	genMs, first := h.timeMs(func() string {
-		txt, _, _ := h.ad.Generate(ctx, r.Full, frag.TokenEnd, 1)
-		return txt
-	})
-	return Sample{
-		Index:      i,
-		ClusterID:  r.ClusterID,
-		Status:     status,
-		TTFTms:     injMs + genMs,
-		InjectMs:   injMs,
-		FragBytes:  frag.SizeBytes(),
-		FirstToken: first,
-	}
-}
-
-// cosine similarity with explicit norms (embeddings may not be pre-normalised).
 func cosine(a, b []float32) float32 {
 	var dot, na, nb float32
 	for i := range a {
@@ -284,8 +377,6 @@ func cosine(a, b []float32) float32 {
 	return dot / float32(math.Sqrt(float64(na))*math.Sqrt(float64(nb)))
 }
 
-// readRSSMB reads resident set size from /proc/self/status (Linux/Android).
-// Returns 0 on platforms without procfs.
 func readRSSMB() float64 {
 	b, err := os.ReadFile("/proc/self/status")
 	if err != nil {
