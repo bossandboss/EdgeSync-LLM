@@ -182,6 +182,21 @@ func printTable(m *Manifest) {
 		fmt.Println("\n  ⚠ ENGINE ERRORS OCCURRED. Latencies above may include failure paths.")
 	}
 
+	if r.InertChecked > 0 {
+		pct := float64(r.InertHits) / float64(r.InertChecked) * 100
+		fmt.Printf("  inert-fragment test  %.1f%%  (%d/%d hits matched a NO-PREFIX generation)\n",
+			pct, r.InertHits, r.InertChecked)
+		if r.InertHits > 0 {
+			fmt.Println("\n  ⛔ THE FRAGMENT IS INERT.")
+			fmt.Println("     Injected KV bytes are being ignored: the warm output equals what the")
+			fmt.Println("     model produces from the SUFFIX ALONE, with no prefix at all. The")
+			fmt.Println("     measured speedup is not cache reuse — it is silently dropped context.")
+			fmt.Println("     llama.cpp's cell table (pos, seq_id) is not restored by the raw tensor")
+			fmt.Println("     write, so attention never sees the injected cells.")
+			fmt.Println("     DO NOT PUBLISH ANY SPEEDUP FROM THIS RUN.")
+		}
+	}
+
 	if r.TotalHits > 0 && r.MatchRatePct < 99.0 {
 		fmt.Println("\n  ⚠ CORRECTNESS WARNING: injected-fragment output diverges from cold")
 		fmt.Println("    output on some hits. A KV cache that changes results is a bug, not")

@@ -47,7 +47,9 @@ const (
 	// Caching every layer costs 2× memory; every other layer (stride=2) gives
 	// ~70% of the latency benefit at half the storage cost.
 	// Set to 1 for full-density caching (high-RAM devices only).
-	FragmentLayerStride = 2
+	// Striding layers cannot preserve output: skipped layers have no KV for the
+	// prefix, so their attention reads empty cells. Full coverage only.
+	FragmentLayerStride = 1
 
 	// DefaultTTLSession is the fragment lifetime for a live interactive session.
 	DefaultTTLSession = 30 * time.Minute

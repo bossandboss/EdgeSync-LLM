@@ -10,7 +10,15 @@ import (
 // Request is one benchmark request. Full is the exact text sent to the engine.
 // PrefixTokensApprox is only used to decide fragment eligibility (span >= 64).
 type Request struct {
-	Full      string
+	Full string
+	// Prefix is the leading span of Full that is shared byte-for-byte with other
+	// requests in the same cluster (system preamble + reused context block). KV
+	// fragments are extracted over THIS span, never over Full: a fragment must
+	// represent state that a later, different request can legitimately reuse.
+	// Extracting over Full would bake in the varying user turn, and injecting it
+	// for another request would silently generate from a KV cache that does not
+	// correspond to that request's tokens.
+	Prefix    string
 	ClusterID int
 }
 
@@ -94,7 +102,8 @@ func buildCorpus(n int, prefixShare float64, seed int64) []Request {
 		ctx := contexts[cid]
 		turn := ctx.userTurns[rng.Intn(len(ctx.userTurns))]
 
-		var full string
+		var full, prefix string
+		prefix = ctx.preamble
 		if reuse {
 			// Same preamble byte-for-byte (the cacheable prefix) + a different
 			// short user turn. This is the request a KV fragment can serve.
@@ -106,10 +115,10 @@ func buildCorpus(n int, prefixShare float64, seed int64) []Request {
 			// prefix, so -prefix-share 0 really does mean "no reuse possible"
 			// (all misses, cold path only).
 			seen[cid] = true
-			full = ctx.preamble + fmt.Sprintf("\nSession: %s-%06d\n", uniqueTag, i) +
-				"\n\nUser: " + turn + "\nAssistant:"
+			prefix = ctx.preamble + fmt.Sprintf("\nSession: %s-%06d\n", uniqueTag, i)
+			full = prefix + "\n\nUser: " + turn + "\nAssistant:"
 		}
-		reqs[i] = Request{Full: full, ClusterID: cid}
+		reqs[i] = Request{Full: full, Prefix: prefix, ClusterID: cid}
 	}
 	return reqs
 }

@@ -68,6 +68,7 @@ type Sample struct {
 	FragBytes  int     `json:"frag_bytes"`
 	FirstToken string  `json:"-"`
 	ColdToken  string  `json:"-"`
+	TruncToken string  `json:"-"`
 }
 
 type Report struct {
@@ -91,6 +92,8 @@ type Report struct {
 	GenErrors     int      `json:"generate_errors"`
 	ExtractErrors int      `json:"extract_errors"`
 	InjectErrors  int      `json:"inject_errors"`
+	InertHits     int      `json:"inert_hits"`
+	InertChecked  int      `json:"inert_checked"`
 	PromptTokens  int      `json:"preflight_prompt_tokens"`
 	PrefillTokPS  float64  `json:"preflight_prefill_tok_per_s"`
 	Samples       []Sample `json:"-"`
@@ -184,7 +187,17 @@ func (h *harness) measureCold(ctx context.Context, r Request) (float64, string, 
 	}, "cold Generate")
 }
 
+// measureWarm times the FULL warm path as one unit: clear, inject, generate.
+//
+// These cannot be timed as two independent repeated closures. Generate advances
+// the KV cache (positions 123..132 for a 133-token prompt whose fragment covers
+// 123). A second Generate starting again at 123 is then rejected by llama.cpp:
+// "sequence positions must remain consecutive, Y = X + 1". Every repeat must
+// therefore restore the cache first. Timing clear+inject+generate together is
+// also the honest definition of warm TTFT: a deployment pays the injection cost
+// on every cache hit.
 func (h *harness) measureWarm(ctx context.Context, r Request, frag *cache.KVFragment) (float64, float64, string, error) {
+	// Injection cost alone, for the reported breakdown.
 	inj, _, err := h.timeMs(func() (string, error) {
 		if e := h.ad.ClearKVCache(ctx); e != nil {
 			return "", e
@@ -194,14 +207,21 @@ func (h *harness) measureWarm(ctx context.Context, r Request, frag *cache.KVFrag
 	if err != nil {
 		return 0, 0, "", err
 	}
-	gen, first, err := h.timeMs(func() (string, error) {
+	// Warm TTFT: the whole path, re-established on every repeat.
+	ttft, first, err := h.timeMs(func() (string, error) {
+		if e := h.ad.ClearKVCache(ctx); e != nil {
+			return "", e
+		}
+		if e := h.ad.InjectFragment(ctx, frag); e != nil {
+			return "", e
+		}
 		txt, _, e := h.ad.Generate(ctx, r.Full, frag.TokenEnd, 1)
 		return txt, e
 	}, "warm Generate")
 	if err != nil {
 		return 0, 0, "", err
 	}
-	return inj + gen, inj, first, nil
+	return ttft, inj, first, nil
 }
 
 // Run measures cold and warm for EACH request back to back, in randomised
@@ -224,7 +244,10 @@ func (h *harness) Run(reqs []Request) (*Report, error) {
 	var totalFragBytes int
 
 	for i, r := range reqs {
-		emb, encErr := h.enc.Encode(r.Full)
+		// Look up by the SHARED PREFIX, not the whole prompt. Two requests in the
+		// same cluster differ in their final user turn; only their prefix KV state
+		// is reusable.
+		emb, encErr := h.enc.Encode(r.Prefix)
 
 		bestSim, bestID := float32(-1), -1
 		if encErr == nil && len(storedVecs) > 0 {
@@ -265,8 +288,8 @@ func (h *harness) Run(reqs []Request) (*Report, error) {
 					if h.cfg.Strict {
 						return nil, fmt.Errorf("request %d: Tokenize: %w", i, err)
 					}
-				} else if len(toks) >= cache.FragmentGranularityTokens {
-					frag, err := h.ad.ExtractFragment(ctx, toks, 0, h.ad.ModelID().NumLayers, cache.FragmentLayerStride, emb)
+				} else if k := h.prefixTokenCount(ctx, r, toks); k >= cache.FragmentGranularityTokens {
+					frag, err := h.ad.ExtractFragment(ctx, toks[:k], 0, h.ad.ModelID().NumLayers, cache.FragmentLayerStride, emb)
 					if err != nil || frag == nil {
 						if err == nil {
 							err = fmt.Errorf("ExtractFragment returned nil fragment")
@@ -313,6 +336,12 @@ func (h *harness) Run(reqs []Request) (*Report, error) {
 			continue
 		}
 
+		// Decisive control: does the warm output equal a no-prefix generation?
+		truncTok, tErr := h.measureTruncated(ctx, r)
+		if tErr != nil {
+			truncTok = ""
+		}
+
 		coldAll = append(coldAll, coldMs)
 		fragAll = append(fragAll, warmMs)
 		fragHits = append(fragHits, warmMs)
@@ -325,6 +354,7 @@ func (h *harness) Run(reqs []Request) (*Report, error) {
 			Index: i, ClusterID: r.ClusterID, Status: status,
 			TTFTms: warmMs, ColdMs: coldMs, InjectMs: injMs,
 			FragBytes: frag.SizeBytes(), FirstToken: warmTok, ColdToken: coldTok,
+			TruncToken: truncTok,
 		})
 	}
 
@@ -345,6 +375,14 @@ func (h *harness) Run(reqs []Request) (*Report, error) {
 			rep.TotalHits++
 			if s.FirstToken == s.ColdToken {
 				rep.CorrectHits++
+			}
+			if s.TruncToken != "" {
+				rep.InertChecked++
+				// Warm agrees with the no-prefix control but not with cold:
+				// the fragment demonstrably contributed nothing.
+				if s.FirstToken == s.TruncToken && s.FirstToken != s.ColdToken {
+					rep.InertHits++
+				}
 			}
 		}
 	}
@@ -393,4 +431,57 @@ func readRSSMB() float64 {
 		}
 	}
 	return 0
+}
+
+// prefixTokenCount returns how many leading tokens of the full prompt are
+// covered byte-for-byte by r.Prefix.
+//
+// It does NOT simply return len(Tokenize(r.Prefix)). BPE merges across the join:
+// the last token of the prefix, tokenized alone, can differ from the token that
+// appears at that position when the full prompt is tokenized. Injecting a
+// fragment whose final token disagrees with the prompt would corrupt generation
+// in a way no size check catches. So compare the two token streams and keep only
+// the leading run that agrees.
+func (h *harness) prefixTokenCount(ctx context.Context, r Request, fullToks []int32) int {
+	pt, err := h.ad.Tokenize(ctx, r.Prefix)
+	if err != nil {
+		return 0
+	}
+	n := len(pt)
+	if n > len(fullToks) {
+		n = len(fullToks)
+	}
+	k := 0
+	for k < n && pt[k] == fullToks[k] {
+		k++
+	}
+	return k
+}
+
+// measureTruncated generates from the suffix ALONE — the part of the prompt the
+// fragment does not cover — with no injection and no prefix at all.
+//
+// This is the decisive control. Timing cannot tell a working fragment from an
+// ignored one: both skip the prefix computation, so both are fast. Only the
+// OUTPUT separates them.
+//
+//	warm token == cold token       -> the fragment carried the prefix's state.
+//	warm token == truncated token  -> the prefix was never attended to; the
+//	                                  fragment is inert and the speedup is an
+//	                                  artifact of silently dropping context.
+//
+// A first-token match rate alone is weak here: a chat-tuned model asked to
+// continue raw text often emits its end-of-turn token regardless of context, so
+// cold and warm can agree by coincidence. Comparing against the truncated
+// control removes that coincidence.
+func (h *harness) measureTruncated(ctx context.Context, r Request) (string, error) {
+	suffix := strings.TrimPrefix(r.Full, r.Prefix)
+	if suffix == r.Full || suffix == "" {
+		return "", fmt.Errorf("truncated control: prefix is not a prefix of full prompt")
+	}
+	if err := h.ad.ClearKVCache(ctx); err != nil {
+		return "", err
+	}
+	txt, _, err := h.ad.Generate(ctx, suffix, 0, 1)
+	return txt, err
 }

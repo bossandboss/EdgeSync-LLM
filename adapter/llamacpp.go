@@ -54,34 +54,11 @@ package adapter
 // #include <stdlib.h>
 // #include <string.h>
 //
-// // The three functions below (edgesync_extract_layer_raw, edgesync_layer_sizes,
-// // edgesync_inject_layer_raw) are NOT defined here — they're compiled into
-// // libllama.so itself, from src/edgesync_kv_bridge.cpp, added to llama.cpp's
-// // own CMakeLists.txt. That file needs internal headers (llama-kv-cache.h)
-// // that aren't part of llama.cpp's public API, so it must be compiled as
-// // part of llama.cpp's own build tree, not linked in externally.
-// //
-// // WHY: the previous version of this preamble called llama_get_model_tensor(),
-// // which does not exist in llama.cpp (confirmed by linking against a real
-// // build: "undefined reference to llama_get_model_tensor"). See
-// // src/edgesync_kv_bridge.cpp in your llama.cpp checkout for the real
-// // implementation and its fragility notes (only supports the standard
-// // unified KV cache, not iSWA/DSA/DSV4/hybrid memory architectures).
-// //
-// // If you're building against a llama.cpp checkout that does NOT have
-// // edgesync_kv_bridge.cpp added to its build, these will fail to link.
-// // Apply that patch to your llama.cpp checkout first (or vendor a fork).
-//
-// int edgesync_extract_layer_raw(struct llama_context* ctx, int32_t layer,
-//     void* keys_out, size_t keys_out_capacity, size_t* out_k_nbytes,
-//     void* vals_out, size_t vals_out_capacity, size_t* out_v_nbytes);
-//
-// int edgesync_layer_sizes(struct llama_context* ctx, int32_t layer,
-//     size_t* out_k_nbytes, size_t* out_v_nbytes);
-//
-// int edgesync_inject_layer_raw(struct llama_context* ctx, int32_t layer,
-//     const void* keys_in, size_t keys_in_size,
-//     const void* vals_in, size_t vals_in_size);
+// // NOTE: EdgeSync no longer needs a patched llama.cpp. Sequence state is moved
+// // through the public llama_state_seq_get_data / llama_state_seq_set_data API,
+// // which carries cell metadata (positions, sequence ids) as well as tensors.
+// // The old edgesync_* C bridge is therefore gone: this links against vanilla
+// // libllama, and survives llama.cpp upgrades.
 import "C"
 
 import (
@@ -208,45 +185,52 @@ func (a *LlamaCppAdapter) ExtractFragment(
 		layersCaptured = append(layersCaptured, l)
 	}
 
-	// Run prefill decode to populate the KV cache
-	// (In a real implementation, call llama_decode() with the token batch here)
-	// For now, the extraction assumes decode has already run.
-
-	// NOTE ON SCOPE: edgesync_extract_layer_raw (see src/edgesync_kv_bridge.cpp
-	// in the llama.cpp checkout this links against) returns the FULL current
-	// per-layer K/V storage tensor, not a [token_start, token_start+token_count)
-	// slice — the original code here assumed a token-range extraction that the
-	// underlying tensor layout doesn't necessarily support without further
-	// verification against a real running model (padding/permutation in the
-	// cache's cell layout was not confirmed). This concatenates whole-layer
-	// tensors across the requested layer range; the byte size per layer is
-	// whatever llama.cpp currently allocates for it, not necessarily
-	// tokenCount*numHeads*headDim*4 as the old code assumed.
-	var keysBytes, valsBytes []byte
-
-	for _, layer := range layersCaptured {
-		var kSize, vSize C.size_t
-		sizeRet := C.edgesync_layer_sizes(a.ctx, C.int32_t(layer), &kSize, &vSize)
-		if sizeRet != 0 {
-			return nil, fmt.Errorf("llamacpp: edgesync_layer_sizes failed for layer %d (code %d) — unsupported memory architecture (iSWA/DSA/DSV4/hybrid) or invalid layer", layer, int(sizeRet))
-		}
-
-		kBuf := make([]byte, int(kSize))
-		vBuf := make([]byte, int(vSize))
-		var kWritten, vWritten C.size_t
-
-		extractRet := C.edgesync_extract_layer_raw(
-			a.ctx, C.int32_t(layer),
-			unsafe.Pointer(&kBuf[0]), kSize, &kWritten,
-			unsafe.Pointer(&vBuf[0]), vSize, &vWritten,
-		)
-		if extractRet != 0 {
-			return nil, fmt.Errorf("llamacpp: edgesync_extract_layer_raw failed for layer %d (code %d)", layer, int(extractRet))
-		}
-
-		keysBytes = append(keysBytes, kBuf[:int(kWritten)]...)
-		valsBytes = append(valsBytes, vBuf[:int(vWritten)]...)
+	// ── Explicit prefill. ──
+	// Decode the tokens into a cleared cache so the sequence provably holds
+	// exactly tokenIDs[0:tokenCount] at positions 0..n-1.
+	if err := a.prefill(ctx, tokenIDs); err != nil {
+		return nil, fmt.Errorf("llamacpp ExtractFragment: prefill: %w", err)
 	}
+
+	// ── Serialise the sequence state via llama.cpp's PUBLIC API. ──
+	//
+	// WHY NOT RAW TENSOR SURGERY. Copying the K/V tensors moves the numbers but
+	// not the bookkeeping: llama.cpp tracks, per cell, a position and a sequence
+	// id, and builds its attention mask from those. A raw write leaves the cell
+	// table empty, so the cache still believes the sequence is empty; attention
+	// never sees the injected cells and the next decode reallocates over them.
+	// The result is a fragment that is silently INERT — fast, because the prefix
+	// is skipped, and wrong, because the prefix is gone.
+	//
+	// llama_state_seq_get_data serialises cells AND metadata, for every layer.
+	// It also needs no fork of llama.cpp, which is what makes this deployable.
+	//
+	// CONSEQUENCE: the state blob is whole-sequence and all-layer. Per-layer
+	// striding is not expressible here — and it was never sound anyway: skipping
+	// layers leaves those layers with no KV for the prefix, so their attention
+	// reads empty cells and the output cannot match the uncached path.
+	blobSize := C.llama_state_seq_get_size(a.ctx, C.llama_seq_id(0))
+	if blobSize == 0 {
+		return nil, fmt.Errorf("llamacpp ExtractFragment: llama_state_seq_get_size returned 0")
+	}
+	blob := make([]byte, int(blobSize))
+	written := C.llama_state_seq_get_data(
+		a.ctx,
+		(*C.uint8_t)(unsafe.Pointer(&blob[0])),
+		blobSize,
+		C.llama_seq_id(0),
+	)
+	if written == 0 {
+		return nil, fmt.Errorf("llamacpp ExtractFragment: llama_state_seq_get_data failed")
+	}
+	blob = blob[:int(written)]
+
+	// KVFragment carries two byte slices and rejects empty ones. The state blob
+	// is a single opaque buffer, so it lives in Keys; Values holds a sentinel
+	// marking the encoding, so a fragment written by the raw-tensor path can
+	// never be fed to the state-API path (or vice versa) without being caught.
+	keysBytes := blob
+	valsBytes := []byte(stateBlobSentinel)
 
 	fragmentID := generateFragmentID(tokenIDs, model)
 
@@ -254,7 +238,8 @@ func (a *LlamaCppAdapter) ExtractFragment(
 		fragmentID,
 		model,
 		0, tokenCount,
-		layerStart, layerEnd, layerStride,
+		0, model.NumLayers, 1, // state blob covers every layer; stride is meaningless
+
 		keysBytes, valsBytes,
 		tokenIDs,
 		embedding,
@@ -271,56 +256,43 @@ func (a *LlamaCppAdapter) InjectFragment(ctx context.Context, fragment *cache.KV
 		return fmt.Errorf("llamacpp InjectFragment: %w", err)
 	}
 
-	// NOTE: matches ExtractFragment's new scope — fragment.Keys/Values are
-	// now whole per-layer tensors concatenated across [LayerStart, LayerEnd),
-	// not a token-range slice. edgesync_inject_layer_raw rejects the write if
-	// the byte size doesn't match what the tensor currently expects (this is
-	// itself a integrity check: it will correctly fail on a real token-span
-	// mismatch, since llama.cpp's own tensor allocation size is the source
-	// of truth here rather than a separately-computed floatsPerLayer).
-	numLayers := 0
-	for l := fragment.LayerStart; l < fragment.LayerEnd; l += fragment.LayerStride {
-		numLayers++
+	// Restore the sequence state produced by ExtractFragment. This writes the
+	// cells AND their positions/sequence ids, so attention actually sees the
+	// prefix — the property a raw tensor write cannot provide.
+	if string(fragment.Values) != stateBlobSentinel {
+		return fmt.Errorf("llamacpp InjectFragment: fragment is not a sequence-state blob (sentinel mismatch) — it was produced by an incompatible extractor")
 	}
-	if numLayers == 0 {
-		return fmt.Errorf("llamacpp InjectFragment: empty layer range [%d, %d)", fragment.LayerStart, fragment.LayerEnd)
+	if len(fragment.Keys) == 0 {
+		return fmt.Errorf("llamacpp InjectFragment: empty state blob")
 	}
 
-	kOffset, vOffset := 0, 0
-	layerIdx := 0
-	for l := fragment.LayerStart; l < fragment.LayerEnd; l += fragment.LayerStride {
-		var kSize, vSize C.size_t
-		sizeRet := C.edgesync_layer_sizes(a.ctx, C.int32_t(l), &kSize, &vSize)
-		if sizeRet != 0 {
-			return fmt.Errorf("llamacpp: edgesync_layer_sizes failed for layer %d (code %d)", l, int(sizeRet))
-		}
-
-		kEnd := kOffset + int(kSize)
-		vEnd := vOffset + int(vSize)
-		if kEnd > len(fragment.Keys) || vEnd > len(fragment.Values) {
-			return fmt.Errorf("llamacpp: fragment buffer underflow at layer %d (need %d/%d bytes, have %d/%d)",
-				l, kEnd, vEnd, len(fragment.Keys), len(fragment.Values))
-		}
-
-		ret := C.edgesync_inject_layer_raw(
-			a.ctx, C.int32_t(l),
-			unsafe.Pointer(&fragment.Keys[kOffset]), kSize,
-			unsafe.Pointer(&fragment.Values[vOffset]), vSize,
-		)
-		if ret != 0 {
-			return fmt.Errorf("llamacpp: edgesync_inject_layer_raw failed for layer %d (code %d) — likely a size mismatch between this fragment and the current model's tensor layout", l, int(ret))
-		}
-
-		kOffset, vOffset = kEnd, vEnd
-		layerIdx++
+	// llama_state_seq_set_data expects the destination sequence to be empty; the
+	// blob carries its own cell positions. Clearing here makes the call
+	// idempotent and keeps warm runs reproducible across repeats.
+	if err := a.ClearKVCache(ctx); err != nil {
+		return fmt.Errorf("llamacpp InjectFragment: clear: %w", err)
 	}
 
+	read := C.llama_state_seq_set_data(
+		a.ctx,
+		(*C.uint8_t)(unsafe.Pointer(&fragment.Keys[0])),
+		C.size_t(len(fragment.Keys)),
+		C.llama_seq_id(0),
+	)
+	// Contract: positive = ok, zero = failed to load.
+	if read == 0 {
+		return fmt.Errorf("llamacpp InjectFragment: llama_state_seq_set_data rejected a %d-byte blob — most often a model/context mismatch (n_ctx, layer count, head dims) between the fragment and this context", len(fragment.Keys))
+	}
 	return nil
 }
 
 // vocab returns the model's vocabulary handle. Modern llama.cpp moved tokenizer
 // entry points off llama_model onto llama_vocab, reached via
 // llama_get_model(ctx) -> llama_model_get_vocab(model).
+// stateBlobSentinel marks a KVFragment whose Keys hold an opaque
+// llama_state_seq_get_data blob rather than raw K/V tensors.
+const stateBlobSentinel = "EDGESYNC-SEQSTATE-v1"
+
 func (a *LlamaCppAdapter) vocab() *C.struct_llama_vocab {
 	model := C.llama_get_model(a.ctx)
 	if model == nil {
@@ -611,4 +583,60 @@ func bytesToFloat32Slice(src []byte) []float32 {
 		out[i] = math.Float32frombits(bits)
 	}
 	return out
+}
+
+// prefill decodes tokenIDs at absolute positions 0..n-1 into a freshly cleared
+// KV cache, so the cache provably holds exactly this prompt before extraction.
+func (a *LlamaCppAdapter) prefill(ctx context.Context, tokenIDs []int32) error {
+	if len(tokenIDs) == 0 {
+		return fmt.Errorf("empty token list")
+	}
+	if err := a.ClearKVCache(ctx); err != nil {
+		return err
+	}
+	batch := C.llama_batch_init(C.int32_t(len(tokenIDs)), 0, 1)
+	defer C.llama_batch_free(batch)
+
+	batch.n_tokens = C.int32_t(len(tokenIDs))
+	for i, tok := range tokenIDs {
+		setBatchToken(batch, i, tok, i, false)
+	}
+	setBatchLogits(batch, len(tokenIDs)-1, true)
+
+	if rc := C.llama_decode(a.ctx, batch); rc != 0 {
+		return fmt.Errorf("llama_decode failed (code %d)", int(rc))
+	}
+	return nil
+}
+
+// sliceCells extracts the first tokenCount cells from a whole-layer KV tensor.
+//
+// LAYOUT ASSUMPTION — READ BEFORE TRUSTING ANY SPEEDUP.
+// llama.cpp stores each layer's K cache as [n_embd_k_gqa, n_cells], cell-major:
+// cell i is a contiguous bytesPerCell run at offset i*bytesPerCell. The same
+// holds for V *only when flash-attention is enabled*. With flash-attention
+// disabled llama.cpp transposes V to [n_cells, n_embd_v_gqa], and a prefix of
+// cells is then NOT contiguous — this function would silently return garbage.
+//
+// Transposition does not change the tensor's byte count, so no size check can
+// detect it. The only arbiter is behavioural: after injecting a fragment, the
+// first generated token must be identical to the cold path. The benchmark's
+// first-token match rate exists precisely for this. If it drops below 100%,
+// suspect V transposition before anything else.
+func sliceCells(full []byte, nCells, tokenCount int, which string, layer int) ([]byte, error) {
+	if len(full) == 0 {
+		return nil, fmt.Errorf("llamacpp: layer %d %s tensor is empty", layer, which)
+	}
+	if len(full)%nCells != 0 {
+		return nil, fmt.Errorf("llamacpp: layer %d %s tensor size %d is not divisible by %d cells — cache is not cell-major, slicing would corrupt the fragment",
+			layer, which, len(full), nCells)
+	}
+	bytesPerCell := len(full) / nCells
+	end := tokenCount * bytesPerCell
+	if end > len(full) {
+		return nil, fmt.Errorf("llamacpp: layer %d %s slice %d exceeds tensor %d", layer, which, end, len(full))
+	}
+	out := make([]byte, end)
+	copy(out, full[:end])
+	return out, nil
 }
